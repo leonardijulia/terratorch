@@ -172,7 +172,7 @@ class WeightedMetricWrapper(WrapperMetric):
     
     def compute(self) -> Tensor:
         values = self.wrapped_metric.compute()
-        weighted_values =  values * self.weights   
+        weighted_values =  values * self.weights.to(values.device)   
         return weighted_values.sum() / self.weights.sum()    
 
 def check_weights_classes(var_weights: Tensor, num_outputs: int):
@@ -229,6 +229,7 @@ class PixelwiseRegressionTask(TerraTorchTask):
         ignore_index: int | None = None,
         lr: float = 0.001,
         # TODO: customize for multivariate regression as well
+        num_outputs: int = 1,
         # the following are optional so CLI doesnt need to pass them
         optimizer: str | None = None,
         optimizer_hparams: dict | None = None,
@@ -239,6 +240,7 @@ class PixelwiseRegressionTask(TerraTorchTask):
         freeze_decoder: bool = False,  # noqa: FBT001, FBT002
         freeze_head: bool = False,  # noqa: FBT001, FBT002
         plot_on_val: bool | int = 10,
+        var_names: list[str] | None = None,
         tiled_inference_parameters: dict | None = None,
         test_dataloaders_names: list[str] | None = None,
         lr_overrides: dict[str, float] | None = None,
@@ -264,6 +266,7 @@ class PixelwiseRegressionTask(TerraTorchTask):
             var_weights (list[float] | None, optional): List of class weights to be applied to the loss.
                 Defaults to None.
             ignore_index (int | None, optional): Label to ignore in the loss computation. Defaults to None.
+            num_outputs (int): Number of predicted regression variables. Defaults to single regression.
             lr (float, optional): Learning rate to be used. Defaults to 0.001.
             optimizer (str | None, optional): Name of optimizer class from torch.optim to be used.
                 If None, will use Adam. Defaults to None. Overriden by config / cli specification through LightningCLI.
@@ -279,6 +282,7 @@ class PixelwiseRegressionTask(TerraTorchTask):
             freeze_head (bool, optional): Whether to freeze the segmentation head. Defaults to False.
             plot_on_val (bool | int, optional): Whether to plot visualizations on validation.
                 If true, log every epoch. Defaults to 10. If int, will plot every plot_on_val epochs.
+            var_names (list[str] | None, optional): List of variable names passed to metrics for metrics naming.
             tiled_inference_parameters (dict | None, optional): Inference parameters
                 used to determine if inference is done on the whole image or through tiling.
             test_dataloaders_names (list[str] | None, optional): Names used to differentiate metrics when
@@ -291,10 +295,15 @@ class PixelwiseRegressionTask(TerraTorchTask):
             tiled_inference_on_validation (bool): A boolean to define if tiled inference will be used during the val step. 
             path_to_record_metrics (str): A path to save the file containing the metrics log.
         """
-
         self.tiled_inference_parameters = tiled_inference_parameters
         self.aux_loss = aux_loss
         self.aux_heads = aux_heads
+        if num_outputs < 1:
+            raise ValueError("num_outputs can't be less than 1.") 
+        self.num_outputs = num_outputs
+        self.var_weights = (
+            torch.Tensor(var_weights) if var_weights is not None else None
+        ) 
 
         if model is not None and model_factory is not None:
             logger.warning("A model_factory and a model was provided. The model_factory is ignored.")
@@ -332,10 +341,11 @@ class PixelwiseRegressionTask(TerraTorchTask):
         loss = self.hparams["loss"]
         ignore_index = self.hparams["ignore_index"]
 
-        if isinstance(loss, str):
+        if isinstance(loss, str): 
+            # Implement the same logic as in scalar regression for custom nn.Module which works with the parser (?)
             # Single loss
             self.criterion = init_loss(loss, ignore_index=ignore_index)
-        elif isinstance(loss, nn.Module):
+        elif isinstance(loss, nn.Module): # this doesn't work with the parser
             # Custom loss
             self.criterion = loss
         elif isinstance(loss, list):
@@ -356,13 +366,13 @@ class PixelwiseRegressionTask(TerraTorchTask):
 
     def configure_metrics(self) -> None:
         """Initialize the performance metrics."""
-
+        var_names = self.hparams["var_names"]
         def instantiate_metrics():
             return {
-                "RMSE": MeanSquaredError(squared=False),
-                "MSE": MeanSquaredError(squared=True),
-                "MAE": MeanAbsoluteError(),
-                "R2_Score": R2Score(),
+                "RMSE": MeanSquaredError(num_outputs=self.num_outputs, squared=False),
+                "MSE": MeanSquaredError(num_outputs=self.num_outputs, squared=True),
+                "MAE": MeanAbsoluteError(num_outputs=self.num_outputs),
+                "R2_Score": R2Score(multioutput="raw_values"),
             }
 
         def wrap_metrics_with_ignore_index(metrics):
@@ -577,7 +587,7 @@ class ScalarRegressionTask(TerraTorchTask):
             freeze_head (bool, optional): Whether to freeze the segmentation head. Defaults to False.
             plot_on_val (bool | int, optional): Whether to plot visualizations on validation.
                 If true, log every epoch. Defaults to 10. If int, will plot every plot_on_val epochs.
-            var_names (list[str] | None, optional): List of variable names passed to metrics for better naming. 
+            var_names (list[str] | None, optional): List of variable names passed to metrics for metrics naming. 
             test_dataloaders_names (list[str] | None, optional): Names used to differentiate metrics when
                 multiple dataloaders are returned by test_dataloader in the datamodule. Defaults to None,
                 which assumes only one test dataloader is used.
@@ -640,7 +650,7 @@ class ScalarRegressionTask(TerraTorchTask):
             else:
                 self.criterion = init_loss(loss, ignore_index=ignore_index) 
             
-        elif isinstance(loss, nn.Module):
+        elif isinstance(loss, nn.Module): # this doesn't work with the parser
             # Custom loss
             self.criterion = loss
         
